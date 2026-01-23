@@ -34,7 +34,7 @@ pip install -r requirements.txt
 
 #### Load model:
 ```python
-from zipvoice.luxtts import LuxTTS
+from zipvoice.luxvoice import LuxTTS
 lux_tts = LuxTTS('YatharthS/LuxTTS', device='cuda', threads=2) ## change device to cpu for cpu usage
 ```
 
