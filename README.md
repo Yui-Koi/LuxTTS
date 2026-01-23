@@ -101,7 +101,7 @@ A: Yes, currently it uses float32. Float16 should be significantly faster(almost
 ## Roadmap
 
 - [x] Release model and code
-- [ ] Huggingface spaces demo
+- [x] Huggingface spaces demo
 - [ ] Release code for float16 inference
 
 ## Acknowledgments
@@ -111,7 +111,7 @@ A: Yes, currently it uses float32. Float16 should be significantly faster(almost
   
 ## Final Notes
 
-This project is licensed under the Apache-2.0 license. See LICENSE for details.
+The model and code are licensed under the Apache-2.0 license. See LICENSE for details.
 
 Stars/Likes would be appreciated, thank you.
 
