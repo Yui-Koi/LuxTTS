@@ -45,6 +45,14 @@ class DiffusionModel(torch.nn.Module):
         speech_condition: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         guidance_scale: Union[float, torch.Tensor] = 0.0,
+        # Explicitly list CFG params to filter them from kwargs
+        use_cfg: bool = False,
+        speech_gate_open: bool = False,
+        text_condition_cfg: Optional[torch.Tensor] = None,
+        speech_condition_cfg_early: Optional[torch.Tensor] = None,
+        speech_condition_cfg_late: Optional[torch.Tensor] = None,
+        padding_mask_cfg: Optional[torch.Tensor] = None,
+        x_buffer: Optional[torch.Tensor] = None,
         **kwargs
     ) -> torch.Tensor:
         """
@@ -68,7 +76,15 @@ class DiffusionModel(torch.nn.Module):
                 guidance_scale, dtype=t.dtype, device=t.device
             )
 
-        if (guidance_scale == 0.0).all():
+        # Check use_cfg flag first (avoiding tensor sync if possible)
+        use_cfg = kwargs.get("use_cfg", None)
+        if use_cfg is None:
+            # Fallback for backward compatibility or if called directly without flags
+            use_cfg = not (guidance_scale == 0.0).all()
+
+        if not use_cfg:
+            if t.dim() == 0:
+                t = t.expand(x.shape[0])
             return self.model_func(
                 t=t,
                 xt=x,
@@ -80,29 +96,63 @@ class DiffusionModel(torch.nn.Module):
         else:
             assert t.dim() == 0
 
-            x = torch.cat([x] * 2, dim=0)
-            padding_mask = torch.cat([padding_mask] * 2, dim=0)
+            # Optimizations: reuse preallocated buffers if available
+            x_buffer = kwargs.get("x_buffer", None)
+            text_condition_cfg = kwargs.get("text_condition_cfg", None)
+            speech_condition_cfg_early = kwargs.get("speech_condition_cfg_early", None)
+            speech_condition_cfg_late = kwargs.get("speech_condition_cfg_late", None)
+            padding_mask_cfg = kwargs.get("padding_mask_cfg", None)
 
-            text_condition = torch.cat(
-                [torch.zeros_like(text_condition), text_condition], dim=0
-            )
+            if x_buffer is not None:
+                B = x.shape[0]
+                x_buffer[:B].copy_(x)
+                x_buffer[B:].copy_(x)
+                x_in = x_buffer
+            else:
+                x_in = torch.cat([x] * 2, dim=0)
 
-            if t > 0.5:
-                speech_condition = torch.cat(
-                    [torch.zeros_like(speech_condition), speech_condition], dim=0
+            if padding_mask_cfg is not None:
+                padding_mask_in = padding_mask_cfg
+            else:
+                padding_mask_in = torch.cat([padding_mask] * 2, dim=0) if padding_mask is not None else None
+
+            if text_condition_cfg is not None:
+                text_condition_in = text_condition_cfg
+            else:
+                text_condition_in = torch.cat(
+                    [torch.zeros_like(text_condition), text_condition], dim=0
                 )
+
+            # Use precomputed speech_gate_open if available, else fallback to t > 0.5 (sync!)
+            speech_gate_open = kwargs.get("speech_gate_open", None)
+            if speech_gate_open is None:
+                speech_gate_open = (t > 0.5).item()
+
+            if speech_gate_open:
+                if speech_condition_cfg_late is not None:
+                    speech_condition_in = speech_condition_cfg_late
+                else:
+                    speech_condition_in = torch.cat(
+                        [torch.zeros_like(speech_condition), speech_condition], dim=0
+                    )
             else:
                 guidance_scale = guidance_scale * 2
-                speech_condition = torch.cat(
-                    [speech_condition, speech_condition], dim=0
-                )
+                if speech_condition_cfg_early is not None:
+                    speech_condition_in = speech_condition_cfg_early
+                else:
+                    speech_condition_in = torch.cat(
+                        [speech_condition, speech_condition], dim=0
+                    )
+
+            if t.dim() == 0:
+                t = t.expand(x_in.shape[0])
 
             data_uncond, data_cond = self.model_func(
                 t=t,
-                xt=x,
-                text_condition=text_condition,
-                speech_condition=speech_condition,
-                padding_mask=padding_mask,
+                xt=x_in,
+                text_condition=text_condition_in,
+                speech_condition=speech_condition_in,
+                padding_mask=padding_mask_in,
                 **kwargs
             ).chunk(2, dim=0)
 
@@ -132,6 +182,14 @@ class DistillDiffusionModel(DiffusionModel):
         speech_condition: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         guidance_scale: Union[float, torch.Tensor] = 0.0,
+        # Explicitly list CFG params to filter them from kwargs passed to model_func
+        use_cfg: bool = False,
+        speech_gate_open: bool = False,
+        text_condition_cfg: Optional[torch.Tensor] = None,
+        speech_condition_cfg_early: Optional[torch.Tensor] = None,
+        speech_condition_cfg_late: Optional[torch.Tensor] = None,
+        padding_mask_cfg: Optional[torch.Tensor] = None,
+        x_buffer: Optional[torch.Tensor] = None,
         **kwargs
     ) -> torch.Tensor:
         """
@@ -154,6 +212,9 @@ class DistillDiffusionModel(DiffusionModel):
             guidance_scale = torch.tensor(
                 guidance_scale, dtype=t.dtype, device=t.device
             )
+        if t.dim() == 0:
+            t = t.expand(x.shape[0])
+
         return self.model_func(
             t=t,
             xt=x,
@@ -203,9 +264,52 @@ class EulerSolver:
             device=device,
         )
 
+        # Precompute dt
+        dt = timesteps[1:] - timesteps[:-1]
+
+        # Determine CFG usage once
+        if isinstance(guidance_scale, float):
+            use_cfg = (guidance_scale != 0.0)
+        else:
+            # Assume tensor guidance implies CFG usage
+            use_cfg = True
+
+        # Precompute speech gating (t > 0.5) to avoid sync inside loop
+        # timesteps is on device, move to cpu for bool check
+        timesteps_cpu = timesteps.detach().cpu()
+        speech_gating = (timesteps_cpu > 0.5).tolist()
+
+        # Workstream 3: Eliminate per-step allocations in CFG wrapper
+        text_condition_cfg = None
+        speech_condition_cfg_early = None
+        speech_condition_cfg_late = None
+        padding_mask_cfg = None
+        x_buffer = None
+
+        if use_cfg:
+            # Precompute concatenated conditions once
+            text_condition_cfg = torch.cat(
+                [torch.zeros_like(text_condition), text_condition], dim=0
+            )
+
+            speech_condition_cfg_late = torch.cat(
+                [torch.zeros_like(speech_condition), speech_condition], dim=0
+            )
+            speech_condition_cfg_early = torch.cat(
+                [speech_condition, speech_condition], dim=0
+            )
+
+            if padding_mask is not None:
+                padding_mask_cfg = torch.cat([padding_mask, padding_mask], dim=0)
+
+            # Preallocate buffer for x doubling (Strategy A)
+            B_sz = x.shape[0]
+            x_buffer = torch.empty(
+                (2 * B_sz, *x.shape[1:]), dtype=x.dtype, device=x.device
+            )
+
         for step in range(num_step):
             t_cur = timesteps[step]
-            t_next = timesteps[step + 1]
 
             # Predict velocity (v)
             v = self.model(
@@ -215,23 +319,20 @@ class EulerSolver:
                 speech_condition=speech_condition,
                 padding_mask=padding_mask,
                 guidance_scale=guidance_scale,
+                use_cfg=use_cfg,
+                speech_gate_open=speech_gating[step],
+                text_condition_cfg=text_condition_cfg,
+                speech_condition_cfg_early=speech_condition_cfg_early,
+                speech_condition_cfg_late=speech_condition_cfg_late,
+                padding_mask_cfg=padding_mask_cfg,
+                x_buffer=x_buffer,
                 **kwargs
             )
 
-            # 1. Predict the clean 'data' (x_1) and 'noise' (x_0)
-            # Flow matching formulation: x_t = (1 - t) * x_0 + t * x_1
-            # Therefore: v = x_1 - x_0
-            x_1_pred = x + (1.0 - t_cur) * v
-            x_0_pred = x - t_cur * v
-
-            if step < num_step - 1:
-                # 2. Probability Flow ODE update (Anchor-based)
-                # This 'anchors' the next point along the predicted line, 
-                # making it more robust than simple Euler integration.
-                x = (1.0 - t_next) * x_0_pred + t_next * x_1_pred
-            else:
-                # Final step: Snap directly to the predicted clean data
-                x = x_1_pred
+            # Euler update: x = x + dt * v
+            # Note: if t_end=1.0, this is mathematically equivalent to the previous
+            # 'snap to x_pred' at the last step.
+            x.add_(v, alpha=dt[step])
 
         return x
 
@@ -272,7 +373,7 @@ def get_time_steps(
         The time step with the shape (num_step + 1,).
     """
 
-    timesteps = torch.linspace(t_start, t_end, num_step + 1, device=device)
+    timesteps = torch.linspace(t_start, t_end, num_step + 1, device=device, dtype=torch.float32)
 
     if t_shift == 1.0:
         return timesteps
