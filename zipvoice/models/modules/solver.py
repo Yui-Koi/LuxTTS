@@ -47,67 +47,79 @@ class DiffusionModel(torch.nn.Module):
         guidance_scale: Union[float, torch.Tensor] = 0.0,
         **kwargs
     ) -> torch.Tensor:
-        """
-        Forward function that Handles the classifier-free guidance.
+        """Forward function that handles classifier-free guidance.
+
         Args:
-            t: The current timestep, a tensor of a tensor of a single float.
-            x: The initial value, with the shape (batch, seq_len, emb_dim).
-            text_condition: The text_condition of the diffision model, with
-                the shape (batch, seq_len, emb_dim).
-            speech_condition: The speech_condition of the diffision model, with the
-                shape (batch, seq_len, emb_dim).
-            padding_mask: The mask for padding; True means masked position, with the
-                shape (batch, seq_len).
-            guidance_scale: The scale of classifier-free guidance, a float or a tensor
-                of shape (batch, 1, 1).
-        Retrun:
-            The prediction with the shape (batch, seq_len, emb_dim).
+            t:
+                Current timestep, a tensor containing a single scalar in (0, 1).
+            x:
+                Current state `x_t`, shape (batch, seq_len, emb_dim).
+            text_condition:
+                Text condition embeddings, shape (batch, seq_len, emb_dim).
+            speech_condition:
+                Speech condition (prompt) embeddings, shape (batch, seq_len, emb_dim).
+            padding_mask:
+                Padding mask; True means masked position, shape (batch, seq_len).
+            guidance_scale:
+                Classifier-free guidance scale. Either a Python float or a tensor of
+                shape (batch, 1, 1) / scalar tensor.
+
+        Returns:
+            Predicted velocity with shape (batch, seq_len, emb_dim).
         """
+        # Fast path: scalar guidance_scale == 0.0 -> no CFG, single forward pass.
         if not torch.is_tensor(guidance_scale):
-            guidance_scale = torch.tensor(
-                guidance_scale, dtype=t.dtype, device=t.device
-            )
-
-        if (guidance_scale == 0.0).all():
-            return self.model_func(
-                t=t,
-                xt=x,
-                text_condition=text_condition,
-                speech_condition=speech_condition,
-                padding_mask=padding_mask,
-                **kwargs
-            )
-        else:
-            assert t.dim() == 0
-
-            x = torch.cat([x] * 2, dim=0)
-            padding_mask = torch.cat([padding_mask] * 2, dim=0)
-
-            text_condition = torch.cat(
-                [torch.zeros_like(text_condition), text_condition], dim=0
-            )
-
-            if t > 0.5:
-                speech_condition = torch.cat(
-                    [torch.zeros_like(speech_condition), speech_condition], dim=0
+            gs = float(guidance_scale)
+            if gs == 0.0:
+                return self.model_func(
+                    t=t,
+                    xt=x,
+                    text_condition=text_condition,
+                    speech_condition=speech_condition,
+                    padding_mask=padding_mask,
+                    **kwargs,
                 )
-            else:
-                guidance_scale = guidance_scale * 2
-                speech_condition = torch.cat(
-                    [speech_condition, speech_condition], dim=0
-                )
+            guidance_scale = torch.tensor(gs, dtype=t.dtype, device=t.device)
 
-            data_uncond, data_cond = self.model_func(
-                t=t,
-                xt=x,
-                text_condition=text_condition,
-                speech_condition=speech_condition,
-                padding_mask=padding_mask,
-                **kwargs
-            ).chunk(2, dim=0)
+        # At this point guidance_scale is a tensor; we always apply CFG.
+        # We avoid converting tensors to Python scalars to prevent GPU syncs.
+        assert t.dim() == 0, "t is expected to be a scalar tensor for CFG"
 
-            res = (1 + guidance_scale) * data_cond - guidance_scale * data_uncond
-            return res
+        # Duplicate batch for conditional/unconditional branches.
+        x = torch.cat([x, x], dim=0)
+        if padding_mask is not None:
+            padding_mask = torch.cat([padding_mask, padding_mask], dim=0)
+
+        # Unconditional text branch gets zero text; conditional branch keeps text.
+        zeros_text = torch.zeros_like(text_condition)
+        text_condition = torch.cat([zeros_text, text_condition], dim=0)
+
+        # "Late" flag on device: 0.0 if t <= 0.5, 1.0 if t > 0.5
+        late = (t > 0.5).to(speech_condition.dtype)
+
+        # Unconditional speech branch:
+        #   early  (late=0): speech
+        #   late   (late=1): 0
+        speech_uncond = speech_condition * (1.0 - late)
+        speech_condition = torch.cat([speech_uncond, speech_condition], dim=0)
+
+        # Effective guidance scale:
+        #   early: 2 * guidance_scale
+        #   late : 1 * guidance_scale
+        s_eff = guidance_scale * (2.0 - late)
+
+        data_uncond, data_cond = self.model_func(
+            t=t,
+            xt=x,
+            text_condition=text_condition,
+            speech_condition=speech_condition,
+            padding_mask=padding_mask,
+            **kwargs,
+        ).chunk(2, dim=0)
+
+        # v = cond + s_eff * (cond - uncond)
+        res = data_cond + s_eff * (data_cond - data_uncond)
+        return res
 
 
 class DistillDiffusionModel(DiffusionModel):
@@ -203,11 +215,17 @@ class EulerSolver:
             device=device,
         )
 
-        for step in range(num_step):
-            t_cur = timesteps[step]
-            t_next = timesteps[step + 1]
+        if num_step <= 0:
+            return x
 
-            # Predict velocity (v)
+        # Pre-compute time intervals on device: dt_i = t_{i+1} - t_i
+        dts = timesteps[1:] - timesteps[:-1]
+
+        # First num_step - 1 steps: linear update x_{t+dt} = x_t + dt * v
+        for step in range(max(num_step - 1, 0)):
+            t_cur = timesteps[step]
+            dt = dts[step]
+
             v = self.model(
                 t=t_cur,
                 x=x,
@@ -215,23 +233,24 @@ class EulerSolver:
                 speech_condition=speech_condition,
                 padding_mask=padding_mask,
                 guidance_scale=guidance_scale,
-                **kwargs
+                **kwargs,
             )
 
-            # 1. Predict the clean 'data' (x_1) and 'noise' (x_0)
-            # Flow matching formulation: x_t = (1 - t) * x_0 + t * x_1
-            # Therefore: v = x_1 - x_0
-            x_1_pred = x + (1.0 - t_cur) * v
-            x_0_pred = x - t_cur * v
+            # In-place update to avoid extra allocations
+            x.add_(v, alpha=dt)
 
-            if step < num_step - 1:
-                # 2. Probability Flow ODE update (Anchor-based)
-                # This 'anchors' the next point along the predicted line, 
-                # making it more robust than simple Euler integration.
-                x = (1.0 - t_next) * x_0_pred + t_next * x_1_pred
-            else:
-                # Final step: Snap directly to the predicted clean data
-                x = x_1_pred
+        # Final step: snap to the predicted clean data x_1
+        t_cur = timesteps[num_step - 1]
+        v = self.model(
+            t=t_cur,
+            x=x,
+            text_condition=text_condition,
+            speech_condition=speech_condition,
+            padding_mask=padding_mask,
+            guidance_scale=guidance_scale,
+            **kwargs,
+        )
+        x.add_(v, alpha=(1.0 - t_cur))
 
         return x
 
