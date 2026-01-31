@@ -73,18 +73,47 @@ Key components:
 
 - **Sampling: Euler ODE Solver**
   - Sampling uses an `EulerSolver` that integrates the ODE over a schedule of time steps.
-  - Time steps can include **rational time shifts** (`t_shift`) to emphasize low-SNR regions and improve perceptual quality.
+  - The solver operates on the learned velocity field `v = x_1 - x_0` and analytically
+    reconstructs predicted `(x_0, x_1)` at each step before re-evaluating the linear
+    mixture at the next time `t_next`.
+  - Time steps can include **rational time shifts** (`t_shift`) to emphasize low-SNR
+    regions and improve perceptual quality.
+
+#### 3.1.1 Classifier-Free Guidance and Conditions
+
+At inference time, ZipVoice is wrapped by a `DiffusionModel` that implements
+**classifier-free guidance (CFG)**:
+
+- The decoder is called on a concatenation of **conditional** and **unconditional**
+  batches (2× batch size) when `guidance_scale > 0`.
+- Unconditional predictions drop **text_condition**, while prompt
+  **speech_condition** is treated differently depending on the timestep:
+  - Early timesteps (`t <= 0.5`): both branches see the same prompt; CFG focuses on
+    text vs no-text while keeping timbre.
+  - Late timesteps (`t > 0.5`): unconditional branch has no prompt; CFG also
+    modulates prompt influence.
+- The final velocity is combined as
+  `(1 + guidance_scale) * v_cond - guidance_scale * v_uncond`.
+
+This means that for the original ZipVoice model, each ODE step with guidance incurs
+roughly **2× decoder compute**.
 
 ### 3.2 ZipVoiceDistill (`zipvoice/models/zipvoice_distill.py`)
 
 `ZipVoiceDistill` is a distilled, faster variant of `ZipVoice` designed for efficient inference.
 
 - Extends the base ZipVoice architecture, but:
-  - Replaces the explicit Euler solver with a **distilled solver** baked into the model.
-  - Embeds **guidance scale** inside the model, so no external guidance hyperparameter is needed at runtime.
+  - Uses `DistillEulerSolver`, which calls into a `DistillDiffusionModel` wrapper
+    with **embedded guidance scale** rather than runtime CFG.
+  - The decoder `TTSZipformer` is configured with `use_guidance_scale_embed=True`,
+    so `guidance_scale` is consumed as an additional embedding instead of doubling
+    the batch.
 - Supports a **two-stage distillation** pipeline (see Training Pipeline):
   1. Distillation from a frozen teacher ZipVoice model.
   2. Self-teaching using an EMA version of the distilled model.
+
+For more detail on the ODE solver, guidance behavior, and hyperparameters such as
+`num_step` and `t_shift`, see `ode_solver.md`.
 
 ### 3.3 Dialog Models (`zipvoice/models/zipvoice_dialog.py`)
 
