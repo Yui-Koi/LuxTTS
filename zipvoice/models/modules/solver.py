@@ -256,8 +256,10 @@ def get_time_steps(
     t_shift: float = 1.0,
     device: torch.device = torch.device("cpu"),
 ) -> torch.Tensor:
-    """Compute the intermediate time steps for sampling.
-
+    """Compute the intermediate time steps for diffusion sampling.
+    Applies monotonic shift: t' = t_shift * t / (1 + (t_shift - 1) * t)
+    Equivalently: t' = t / (inv_s + alpha * t), where inv_s = 1/t_shift, alpha = 1 - inv_s
+       
     Args:
         t_start: The starting time of the sampling (default is 0).
         t_end: The starting time of the sampling (default is 1).
@@ -272,6 +274,9 @@ def get_time_steps(
 
     timesteps = torch.linspace(t_start, t_end, num_step + 1).to(device)
 
-    timesteps = t_shift * timesteps / (1 + (t_shift - 1) * timesteps)
-
-    return timesteps
+    if t_shift == 1.0:
+        return timesteps
+    
+    inv_s = 1.0 / t_shift
+    denom = torch.add(inv_s, timesteps, alpha=1.0 - inv_s)
+    return timesteps.div_(denom)
