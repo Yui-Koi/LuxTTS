@@ -257,30 +257,46 @@ class EulerSolver:
         model: torch.nn.Module,
         func_name: str = "forward_fm_decoder",
     ):
-        """Construct a Euler Solver
-        Args:
-            model: The diffusion model.
-            func_name: The function name to call.
-        """
-        self.model = DiffusionModel(model, func_name=func_name)
+        """Construct a Euler Solver.
 
-    def sample(
+        Args:
+            model:
+                The underlying diffusion model (e.g. ZipVoice or ZipVoiceDialog).
+            func_name:
+                Name of the function to call for velocity prediction, typically
+                ``"forward_fm_decoder"``.
+        """
+        self.model = model
+        # Direct handle to the decoder function so hot paths don't need getattr.
+        self.model_func = getattr(model, func_name)
+        # Whether this solver should apply classifier-free guidance logic.
+        # Distilled models set this to False in DistillEulerSolver.
+        self.supports_cfg: bool = True
+
+    def _sample_core(
         self,
         x: torch.Tensor,
-        text_condition: torch.Tensor,
-        speech_condition: torch.Tensor,
-        padding_mask: torch.Tensor,
-        num_step: int = 10,
-        guidance_scale: Union[float, torch.Tensor] = 0.0,
-        t_start: float = 0.0,
-        t_end: float = 1.0,
-        t_shift: float = 1.0,
-        **kwargs
+        num_step: int,
+        t_start: float,
+        t_end: float,
+        t_shift: float,
+        step_fn,
     ) -> torch.Tensor:
+        """Core ODE loop shared by all solvers.
+
+        Args:
+            x:
+                Initial state at t_start.
+            num_step:
+                Number of ODE steps to run.
+            t_start, t_end, t_shift:
+                Time-range and warp parameters (see get_time_steps).
+            step_fn:
+                Callable taking (t: Tensor, x: Tensor) -> v: Tensor.
+        """
         device = x.device
         assert isinstance(t_start, float) and isinstance(t_end, float)
 
-        # Generate the schedule of timesteps
         timesteps = get_time_steps(
             t_start=t_start,
             t_end=t_end,
@@ -299,34 +315,120 @@ class EulerSolver:
         for step in range(max(num_step - 1, 0)):
             t_cur = timesteps[step]
             dt = dts[step]
-
-            v = self.model(
-                t=t_cur,
-                x=x,
-                text_condition=text_condition,
-                speech_condition=speech_condition,
-                padding_mask=padding_mask,
-                guidance_scale=guidance_scale,
-                **kwargs,
-            )
-
-            # In-place update to avoid extra allocations
+            v = step_fn(t_cur, x)
             x.add_(v, alpha=dt)
 
         # Final step: snap to the predicted clean data x_1
         t_cur = timesteps[num_step - 1]
-        v = self.model(
-            t=t_cur,
-            x=x,
-            text_condition=text_condition,
-            speech_condition=speech_condition,
-            padding_mask=padding_mask,
-            guidance_scale=guidance_scale,
-            **kwargs,
-        )
+        v = step_fn(t_cur, x)
         x.add_(v, alpha=(1.0 - t_cur))
-
         return x
+
+    def sample(
+        self,
+        x: torch.Tensor,
+        text_condition: torch.Tensor,
+        speech_condition: torch.Tensor,
+        padding_mask: torch.Tensor,
+        num_step: int = 10,
+        guidance_scale: Union[float, torch.Tensor] = 0.0,
+        t_start: float = 0.0,
+        t_end: float = 1.0,
+        t_shift: float = 1.0,
+        **kwargs
+    ) -> torch.Tensor:
+        """Run Euler sampling with optional classifier-free guidance.
+
+        This is the main hot path for ZipVoice. For distilled models,
+        DistillEulerSolver disables CFG and only uses embedded guidance
+        inside the decoder.
+        """
+        # Decide once whether to apply CFG, based on solver capability and
+        # the type/value of guidance_scale.
+        use_cfg = False
+        gs_tensor: Optional[torch.Tensor] = None
+
+        if self.supports_cfg:
+            if torch.is_tensor(guidance_scale):
+                gs_tensor = guidance_scale
+                use_cfg = True
+            else:
+                gs = float(guidance_scale)
+                if gs != 0.0:
+                    gs_tensor = torch.tensor(gs, dtype=x.dtype, device=x.device)
+                    use_cfg = True
+
+        if not use_cfg:
+            def step_fn(t_cur: torch.Tensor, x_cur: torch.Tensor) -> torch.Tensor:
+                return self.model_func(
+                    t=t_cur,
+                    xt=x_cur,
+                    text_condition=text_condition,
+                    speech_condition=speech_condition,
+                    padding_mask=padding_mask,
+                    **kwargs,
+                )
+
+            return self._sample_core(
+                x=x,
+                num_step=num_step,
+                t_start=t_start,
+                t_end=t_end,
+                t_shift=t_shift,
+                step_fn=step_fn,
+            )
+
+        # CFG path: allocate 2*B buffers once and reuse inside the ODE loop.
+        batch_size, seq_len, feat_dim = x.shape
+
+        x2 = x.new_empty(2 * batch_size, seq_len, feat_dim)
+        text2 = text_condition.new_empty(2 * batch_size, seq_len, feat_dim)
+        # Text condition is static across timesteps: [zeros; text]
+        text2[:batch_size].zero_()
+        text2[batch_size:].copy_(text_condition)
+
+        pad2 = None
+        if padding_mask is not None:
+            pad2 = padding_mask.new_empty(2 * batch_size, seq_len)
+            pad2[:batch_size].copy_(padding_mask)
+            pad2[batch_size:].copy_(padding_mask)
+
+        speech2 = speech_condition.new_empty(2 * batch_size, seq_len, feat_dim)
+
+        def step_fn(t_cur: torch.Tensor, x_cur: torch.Tensor) -> torch.Tensor:
+            # Compute late flag and effective guidance scale once per step
+            late, s_eff = flow_matching_cfg_factors(
+                t=t_cur, guidance_scale=gs_tensor, dtype=speech_condition.dtype
+            )
+
+            # x2 = [x_cur; x_cur]
+            x2[:batch_size].copy_(x_cur)
+            x2[batch_size:].copy_(x_cur)
+
+            # speech2: uncond = speech * (1 - late), cond = speech
+            speech2[:batch_size].copy_(speech_condition)
+            speech2[:batch_size].mul_(1.0 - late)
+            speech2[batch_size:].copy_(speech_condition)
+
+            out = self.model_func(
+                t=t_cur,
+                xt=x2,
+                text_condition=text2,
+                speech_condition=speech2,
+                padding_mask=pad2,
+                **kwargs,
+            )
+            data_uncond, data_cond = out.chunk(2, dim=0)
+            return data_cond + s_eff * (data_cond - data_uncond)
+
+        return self._sample_core(
+            x=x,
+            num_step=num_step,
+            t_start=t_start,
+            t_end=t_end,
+            t_shift=t_shift,
+            step_fn=step_fn,
+        )
 
 
 class DistillEulerSolver(EulerSolver):
@@ -336,10 +438,15 @@ class DistillEulerSolver(EulerSolver):
         func_name: str = "forward_fm_decoder",
     ):
         """Construct a Euler Solver for distilled diffusion models.
-        Args:
-            model: The diffusion model.
+
+        Distilled models do not use classifier-free guidance in the solver;
+        guidance_scale is embedded inside the decoder itself.
         """
+        # Do not call super().__init__; we want a different model_func and
+        # to disable CFG in the base sampler.
         self.model = DistillDiffusionModel(model, func_name=func_name)
+        self.model_func = self.model  # nn.Module is callable
+        self.supports_cfg = False
 
 
 def get_time_steps(
