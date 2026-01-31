@@ -272,7 +272,7 @@ def get_time_steps(
         The time step with the shape (num_step + 1,).
     """
 
-    timesteps = torch.linspace(t_start, t_end, num_step + 1).to(device)
+    timesteps = torch.linspace(t_start, t_end, num_step + 1, device=device)
 
     if t_shift == 1.0:
         return timesteps
