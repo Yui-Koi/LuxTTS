@@ -15,9 +15,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 
 import torch
+
+
+def flow_matching_cfg_factors(
+    t: torch.Tensor, guidance_scale: torch.Tensor, dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute the late flag and effective guidance scale for flow-matching CFG.
+
+    Args:
+        t:
+            Scalar tensor with current time in (0, 1).
+        guidance_scale:
+            Guidance scale tensor (broadcastable) used for CFG.
+        dtype:
+            Target dtype for the returned `late` tensor.
+
+    Returns:
+        late:
+            Tensor with value 0.0 if t <= 0.5, 1.0 if t > 0.5 (in `dtype`).
+        s_eff:
+            Effective guidance scale tensor, where early timesteps use
+            ``2 * guidance_scale`` and late timesteps use ``1 * guidance_scale``.
+    """
+    late = (t > 0.5).to(dtype)
+    s_eff = guidance_scale * (2.0 - late)
+    return late, s_eff
 
 
 class DiffusionModel(torch.nn.Module):
@@ -36,6 +61,12 @@ class DiffusionModel(torch.nn.Module):
         self.model = model
         self.func_name = func_name
         self.model_func = getattr(self.model, func_name)
+
+        # Scratch buffers for CFG to reduce per-step allocations.
+        self._x2: Optional[torch.Tensor] = None
+        self._speech2: Optional[torch.Tensor] = None
+        self._text2: Optional[torch.Tensor] = None
+        self._pad2: Optional[torch.Tensor] = None
 
     def forward(
         self,
@@ -85,35 +116,78 @@ class DiffusionModel(torch.nn.Module):
         # We avoid converting tensors to Python scalars to prevent GPU syncs.
         assert t.dim() == 0, "t is expected to be a scalar tensor for CFG"
 
-        # Duplicate batch for conditional/unconditional branches.
-        x = torch.cat([x, x], dim=0)
+        # Shapes and dtypes
+        batch_size, seq_len, feat_dim = x.shape
+        device = x.device
+
+        # Allocate or reuse 2x-batch scratch buffers.
+        if (
+            self._x2 is None
+            or self._x2.shape != (2 * batch_size, seq_len, feat_dim)
+            or self._x2.device != device
+            or self._x2.dtype != x.dtype
+        ):
+            self._x2 = x.new_empty(2 * batch_size, seq_len, feat_dim)
+
+        if (
+            self._speech2 is None
+            or self._speech2.shape != speech_condition.shape[:2] + (feat_dim,)
+            or self._speech2.device != speech_condition.device
+            or self._speech2.dtype != speech_condition.dtype
+        ):
+            self._speech2 = speech_condition.new_empty(2 * batch_size, seq_len, feat_dim)
+
         if padding_mask is not None:
-            padding_mask = torch.cat([padding_mask, padding_mask], dim=0)
+            if (
+                self._pad2 is None
+                or self._pad2.shape != (2 * batch_size, seq_len)
+                or self._pad2.device != padding_mask.device
+                or self._pad2.dtype != padding_mask.dtype
+            ):
+                self._pad2 = padding_mask.new_empty(2 * batch_size, seq_len)
+            pad2 = self._pad2
+        else:
+            pad2 = None
 
-        # Unconditional text branch gets zero text; conditional branch keeps text.
-        zeros_text = torch.zeros_like(text_condition)
-        text_condition = torch.cat([zeros_text, text_condition], dim=0)
+        if (
+            self._text2 is None
+            or self._text2.shape != (2 * batch_size, seq_len, feat_dim)
+            or self._text2.device != text_condition.device
+            or self._text2.dtype != text_condition.dtype
+        ):
+            self._text2 = text_condition.new_empty(2 * batch_size, seq_len, feat_dim)
+        text2 = self._text2
 
-        # "Late" flag on device: 0.0 if t <= 0.5, 1.0 if t > 0.5
-        late = (t > 0.5).to(speech_condition.dtype)
+        # Fill x2 = [x; x]
+        self._x2[:batch_size].copy_(x)
+        self._x2[batch_size:].copy_(x)
 
-        # Unconditional speech branch:
-        #   early  (late=0): speech
-        #   late   (late=1): 0
-        speech_uncond = speech_condition * (1.0 - late)
-        speech_condition = torch.cat([speech_uncond, speech_condition], dim=0)
+        # Fill pad2 = [pad; pad] if provided
+        if pad2 is not None and padding_mask is not None:
+            pad2[:batch_size].copy_(padding_mask)
+            pad2[batch_size:].copy_(padding_mask)
 
-        # Effective guidance scale:
-        #   early: 2 * guidance_scale
-        #   late : 1 * guidance_scale
-        s_eff = guidance_scale * (2.0 - late)
+        # Text condition: [zeros; text]
+        text2[:batch_size].zero_()
+        text2[batch_size:].copy_(text_condition)
+
+        # Compute late flag and effective guidance scale on device
+        late, s_eff = flow_matching_cfg_factors(
+            t=t, guidance_scale=guidance_scale, dtype=speech_condition.dtype
+        )
+
+        # Speech condition: uncond = speech * (1 - late), cond = speech
+        speech2 = self._speech2
+        speech2[:batch_size].copy_(speech_condition)
+        speech2[:batch_size].mul_(1.0 - late)
+        speech2[batch_size:].copy_(speech_condition)
 
         data_uncond, data_cond = self.model_func(
             t=t,
-            xt=x,
-            text_condition=text_condition,
-            speech_condition=speech_condition,
-            padding_mask=padding_mask,
+            xt=self._x2,
+            text_condition=text2,
+            speech_condition=speech2,
+            padding_mask=pad2,
             **kwargs,
         ).chunk(2, dim=0)
 

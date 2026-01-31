@@ -192,27 +192,33 @@ class OnnxFlowMatchingModel(nn.Module):
                 guidance_scale=guidance_scale,
             )
         else:
+            # Duplicate batch for conditional/unconditional branches
             x = x.repeat(2, 1, 1)
-            text_condition = torch.cat(
-                [torch.zeros_like(text_condition), text_condition], dim=0
+
+            # Text condition: [zeros; text]
+            zeros_text = torch.zeros_like(text_condition)
+            text_condition = torch.cat([zeros_text, text_condition], dim=0)
+
+            # Compute late flag and effective guidance scale using shared helper
+            from zipvoice.models.modules.solver import flow_matching_cfg_factors
+
+            late, s_eff = flow_matching_cfg_factors(
+                t=t, guidance_scale=guidance_scale, dtype=speech_condition.dtype
             )
-            speech_condition = torch.cat(
-                [
-                    torch.where(
-                        t > 0.5, torch.zeros_like(speech_condition), speech_condition
-                    ),
-                    speech_condition,
-                ],
-                dim=0,
-            )
-            guidance_scale = torch.where(t > 0.5, guidance_scale, guidance_scale * 2.0)
+
+            # Speech condition: uncond = speech * (1 - late), cond = speech
+            speech_uncond = speech_condition * (1.0 - late)
+            speech_condition = torch.cat([speech_uncond, speech_condition], dim=0)
+
             data_uncond, data_cond = self.model_func(
                 t=t,
                 xt=x,
                 text_condition=text_condition,
                 speech_condition=speech_condition,
             ).chunk(2, dim=0)
-            v = (1 + guidance_scale) * data_cond - guidance_scale * data_uncond
+
+            # v = cond + s_eff * (cond - uncond)
+            v = data_cond + s_eff * (data_cond - data_uncond)
             return v
 
 
