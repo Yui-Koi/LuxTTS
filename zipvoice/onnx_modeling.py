@@ -211,7 +211,7 @@ def generate_cpu(
     # [B, T, C] -> [B, C, T], scale by 10, make contiguous for vocoder
     pred_features = pred_features.transpose(1, 2).mul_(10.0).contiguous()
     wav = vocoder.decode(pred_features).squeeze(1).clamp_(-1.0, 1.0)
-    # volume matching
-    wav.mul_(min(prompt_rms / target_rms, 1.0))  # branchless volume matching
+    # Volume matching
+    wav.mul_(min(prompt_rms / target_rms, 1.0))
 
     return wav
