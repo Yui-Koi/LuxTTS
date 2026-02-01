@@ -180,9 +180,8 @@ def sample(
     return x
 
 def generate_cpu(prompt_tokens, prompt_features_lens, prompt_features, prompt_rms, text, model, vocoder, tokenizer, num_step=4, guidance_scale=3.0, speed=1.0, t_shift=0.9, target_rms=0.1):
-    
     tokens = tokenizer.texts_to_token_ids([text])
-    speed = speed * 1.3 ## default is too slow
+    speed = speed * 1.3 # default is too slow
 
     pred_features = sample(
         model=model,
@@ -195,12 +194,17 @@ def generate_cpu(prompt_tokens, prompt_features_lens, prompt_features, prompt_rm
         num_step=num_step,
     )
 
-    # Convert to waveform
+    # ensure min length for vocoder kernel
+    min_frames = 10
+    pad_t = max(0, min_frames - pred_features.shape[1])
+    pred_features = torch.nn.functional.pad(pred_features, (0, 0, 0, pad_t))
+
+    # waveform conversion
     pred_features = pred_features.permute(0, 2, 1) / 0.1
     wav = vocoder.decode(pred_features).squeeze(1).clamp(-1, 1)
-
-    # Volume matching
-    if prompt_rms < target_rms:
-        wav = wav * (prompt_rms / target_rms)
+    
+    # volume matching
+    gain = min(1.0, prompt_rms / target_rms)
+    wav = wav * gain
 
     return wav
