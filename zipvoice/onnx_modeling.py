@@ -179,9 +179,24 @@ def sample(
     x = x[:, prompt_features_len.item() :, :]
     return x
 
-def generate_cpu(prompt_tokens, prompt_features_lens, prompt_features, prompt_rms, text, model, vocoder, tokenizer, num_step=4, guidance_scale=3.0, speed=1.0, t_shift=0.9, target_rms=0.1):
+@torch.inference_mode()
+def generate_cpu(
+    prompt_tokens,
+    prompt_features_lens,
+    prompt_features,
+    prompt_rms,
+    text,
+    model,
+    vocoder,
+    tokenizer,
+    num_step=4,
+    guidance_scale=3.0,
+    speed=1.0,
+    t_shift=0.9,
+    target_rms=0.1,
+):
     tokens = tokenizer.texts_to_token_ids([text])
-    speed = speed * 1.3 # default is too slow
+    speed *= 1.3
 
     pred_features = sample(
         model=model,
@@ -193,18 +208,10 @@ def generate_cpu(prompt_tokens, prompt_features_lens, prompt_features, prompt_rm
         guidance_scale=guidance_scale,
         num_step=num_step,
     )
-
-    # ensure min length for vocoder kernel
-    min_frames = 10
-    pad_t = max(0, min_frames - pred_features.shape[1])
-    pred_features = torch.nn.functional.pad(pred_features, (0, 0, 0, pad_t))
-
-    # waveform conversion
-    pred_features = pred_features.permute(0, 2, 1) / 0.1
-    wav = vocoder.decode(pred_features).squeeze(1).clamp(-1, 1)
-    
+    # [B, T, C] -> [B, C, T], scale by 10, make contiguous for vocoder
+    pred_features = pred_features.transpose(1, 2).mul_(10.0).contiguous()
+    wav = vocoder.decode(pred_features).squeeze(1).clamp_(-1.0, 1.0)
     # volume matching
-    gain = min(1.0, prompt_rms / target_rms)
-    wav = wav * gain
+    wav.mul_(min(prompt_rms / target_rms, 1.0))  # branchless volume matching
 
     return wav
